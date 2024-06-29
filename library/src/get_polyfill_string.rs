@@ -460,19 +460,10 @@ pub async fn get_polyfill_string_stream(
 
     let sorted_features = toposort(&feature_nodes, &feature_edges).unwrap();
     let m = if options.minify { "min" } else { "raw" };
-    let mut sorted_features_bb = vec![];
 
     let polyfill_sources =
         polyfill_sources(Arc::clone(&env), &sorted_features, m, app_version).await?;
 
-    for feature_name in &sorted_features {
-        sorted_features_bb.push((
-            feature_name,
-            polyfill_sources
-                .get(&format!("/{feature_name}/{m}.js"))
-                .expect(&format!("/{feature_name}/{m}.js is present")),
-        ));
-    }
     explainer_comment.push(app_version_text);
     if !options.minify {
         explainer_comment.push(
@@ -517,7 +508,12 @@ pub async fn get_polyfill_string_stream(
         output.write_str(lf);
 
         // Using the graph, stream all the polyfill sources in dependency order
-        for (feature_name, bb) in sorted_features_bb {
+        for (feature_name, bb) in polyfill_sources
+            .into_iter()
+            .map(|File { name, value }| (name, Buffer::from_string(value)))
+        {
+            let feature_name = feature_name.as_str();
+            let bb = &bb;
             let wrap_in_detect = targeted_features[feature_name].flags.contains("gated");
             if wrap_in_detect {
                 let meta = get_polyfill_meta(app_version, feature_name);
@@ -578,11 +574,11 @@ struct File {
 
 async fn polyfill_sources(
     env: Arc<Env>,
-    feature_names: &[String],
+    sorted_features: &[String],
     format: &str,
     version: &str,
-) -> Result<HashMap<String, Buffer>, BoxError> {
-    let params_names = feature_names
+) -> Result<Vec<File>, BoxError> {
+    let params_names = sorted_features
         .iter()
         .map(|feature_name| format!("/{feature_name}/{format}.js"))
         .collect::<Vec<String>>();
@@ -593,16 +589,14 @@ async fn polyfill_sources(
         match fetch_polyfill_sources(Arc::clone(&env), version, &params).await {
             Ok(d1_res) => {
                 if d1_res.success() {
-                    let mut sources = HashMap::new();
                     env.d1_query_metric.with_label_values(&["ok"]).inc();
 
                     let results = d1_res.results::<File>()?;
 
-                    for result in results {
-                        sources.insert(result.name, Buffer::from_string(result.value));
-                    }
+                    // Assert that the returned rows are in the same order as the query
+                    assert!(params_names.iter().eq(&mut results.iter().map(|File {name, ..}| name.as_str())));
 
-                    return Ok(sources);
+                    return Ok(results);
                 } else {
                     env.d1_query_metric.with_label_values(&["d1_err"]).inc();
                     worker::console_error!("retry {i}/5: D1 error: {:?}", d1_res.error());
@@ -633,9 +627,10 @@ async fn fetch_polyfill_sources(
         r#"
               SELECT
                   name,
-                  cast(value as char) as value
+                  cast(files_{safe_version}.value as char) as value
               FROM files_{safe_version}
-              WHERE name IN (SELECT value FROM json_each(?))
+              INNER JOIN json_each(?)
+              ON name = json_each.value
         "#
     ));
 
